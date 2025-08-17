@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>日本語 AI • Speak & Listen</title>
+  <meta name="description" content="Japanese-speaking AI demo — type or speak, get Japanese responses and TTS playback." />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">AI</div>
+        <h1>日本語 AI</h1>
+      </div>
+      <p class="subtitle">Type or speak in Japanese — receive an AI reply and play it back.</p>
+    </header>
+
+    <section class="panel io-panel">
+      <div class="controls-row">
+        <label class="sr-only" for="textInput">Type Japanese</label>
+        <textarea id="textInput" placeholder="ここに日本語で入力してください…" rows="3"></textarea>
+
+        <div class="buttons">
+          <button id="sendBtn" class="btn primary">Send</button>
+          <button id="speakBtn" class="btn" title="Use microphone (Speech-to-Text)">🎙️ Speak</button>
+          <button id="clearBtn" class="btn muted">Clear</button>
+        </div>
+      </div>
+
+      <div class="hint">Tip: Press <kbd>Ctrl/Cmd+Enter</kbd> to send. Use microphone for speech input.</div>
+    </section>
+
+    <section class="panel output-panel" aria-live="polite">
+      <div class="row">
+        <div class="card conversation">
+          <h2>Conversation</h2>
+          <ul id="messages" class="messages">
+            <!-- messages appended here -->
+          </ul>
+        </div>
+
+        <div class="card actions">
+          <h2>Playback</h2>
+          <div class="play-controls">
+            <button id="playTTS" class="btn primary" disabled>Play Last TTS</button>
+            <button id="downloadTTS" class="btn" disabled>Download</button>
+            <div id="status" class="status">Ready</div>
+          </div>
+          <hr/>
+          <h3>Advanced</h3>
+          <p class="muted">You can POST to <code>/api/chat</code> for text -> AI, <code>/api/tts</code> for AI text -> speech, and <code>/api/stt</code> for audio upload -> transcript.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="app-footer">
+      <small>Built with Go backend • Japanese TTS & STT • © <span id="year"></span></small>
+    </footer>
+  </main>
+
+  <audio id="audioPlayer" hidden></audio>
+
+  <script>
+    // --- small frontend to call your Go backend ---
+    // Expected backend endpoints:
+    // POST /api/chat  { "text": "..." }  -> { "reply": "..." }
+    // POST /api/tts   { "text": "..." }  -> returns audio bytes (mp3) or { "url": "/tmp/..." }
+    // POST /api/stt   (multipart/form-data file) -> { "transcript": "..." }
+
+    const textInput = document.getElementById('textInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const speakBtn = document.getElementById('speakBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const messages = document.getElementById('messages');
+    const status = document.getElementById('status');
+    const playTTS = document.getElementById('playTTS');
+    const downloadTTS = document.getElementById('downloadTTS');
+    const audioPlayer = document.getElementById('audioPlayer');
+
+    let lastTTSBlob = null;
+    document.getElementById('year').textContent = new Date().getFullYear();
+
+    // helpers
+    function addMessage(who, text) {
+      const li = document.createElement('li');
+      li.className = 'msg ' + (who === 'user' ? 'u' : 'ai');
+      li.innerHTML = `<div class="who">${who === 'user' ? 'You' : 'AI'}</div><div class="txt">${escapeHtml(text)}</div>`;
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    }
+    function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    async function callChat(text){
+      setStatus('Sending to AI…');
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if(!res.ok) throw new Error('Chat error '+res.status);
+        const data = await res.json();
+        return data.reply || '';
+      } catch(err){
+        console.error(err);
+        setStatus('AI call failed');
+        return '（サーバーエラー：AIに接続できません）';
+      } finally { setStatus('Ready'); }
+    }
+
+    async function callTTS(text){
+      setStatus('Generating speech…');
+      try {
+        // expecting binary audio (mp3) as response
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if(!res.ok) throw new Error('TTS error '+res.status);
+
+        // if server returns JSON with URL: handle both cases
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const json = await res.json();
+          if (json.url) {
+            // server returned a URL to the audio file
+            lastTTSBlob = await fetch(json.url).then(r=>r.blob());
+          } else {
+            throw new Error('Unexpected TTS response');
+          }
+        } else {
+          // assume binary audio
+          lastTTSBlob = await res.blob();
+        }
+
+        const url = URL.createObjectURL(lastTTSBlob);
+        audioPlayer.src = url;
+        playTTS.disabled = false;
+        downloadTTS.disabled = false;
+        setStatus('Speech ready');
+      } catch(err){
+        console.error(err);
+        setStatus('TTS failed');
+      }
+    }
+
+    async function callSTTFromMicrophone(){
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert('Microphone not supported in this browser.');
+        return;
+      }
+      setStatus('Recording (5s)…');
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const rec = new MediaRecorder(stream);
+        const chunks = [];
+        rec.ondataavailable = e => chunks.push(e.data);
+        rec.start();
+        // record fixed 5 seconds or until user clicks speak again — simple approach
+        await new Promise(r => setTimeout(r, 5000));
+        rec.stop();
+        await new Promise(r => rec.onstop = r);
+        stream.getTracks().forEach(t=>t.stop());
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+
+        setStatus('Uploading to STT…');
+        const fd = new FormData();
+        fd.append('file', blob, 'voice.webm');
+        const res = await fetch('/api/stt', { method:'POST', body: fd });
+        if(!res.ok) throw new Error('STT error '+res.status);
+        const json = await res.json();
+        return json.transcript || '';
+      } catch(err){
+        console.error(err);
+        setStatus('STT failed');
+        return '';
+      } finally {
+        setStatus('Ready');
+      }
+    }
+
+    // UI events
+    sendBtn.addEventListener('click', async () => {
+      const text = textInput.value.trim();
+      if(!text) return;
+      addMessage('user', text);
+      textInput.value = '';
+      setStatus('Processing…');
+      const reply = await callChat(text);
+      addMessage('ai', reply);
+      // generate audio automatically
+      await callTTS(reply);
+    });
+
+    clearBtn.addEventListener('click', () => {
+      textInput.value = '';
+      textInput.focus();
+    });
+
+    playTTS.addEventListener('click', () => {
+      if(!audioPlayer.src) return;
+      audioPlayer.play();
+    });
+
+    downloadTTS.addEventListener('click', () => {
+      if(!lastTTSBlob) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(lastTTSBlob);
+      a.download = 'ai-ja.mp3';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+
+    // keyboard shortcut: Ctrl/Cmd+Enter to send
+    textInput.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        sendBtn.click();
+      }
+    });
+
+    // speak button triggers STT flow
+    speakBtn.addEventListener('click', async () => {
+      speakBtn.disabled = true;
+      setStatus('Recording & transcribing...');
+      const transcript = await callSTTFromMicrophone();
+      speakBtn.disabled = false;
+      if(transcript){
+        addMessage('user', transcript);
+        const reply = await callChat(transcript);
+        addMessage('ai', reply);
+        await callTTS(reply);
+      } else {
+        setStatus('No speech captured');
+      }
+    });
+
+    function setStatus(s){
+      status.textContent = s;
+    }
+
+    // friendly fallback message
+    addMessage('ai', 'ようこそ！テキストを入力するか、マイクで話してください。');
+  </script>
+</body>
+</html>
